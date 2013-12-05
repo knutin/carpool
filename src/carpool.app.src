@@ -1,0 +1,12 @@
+{application, carpool,
+ [
+  {description, ""},
+  {vsn, "1"},
+  {registered, []},
+  {applications, [
+                  kernel,
+                  stdlib
+                 ]},
+  {mod, { carpool_app, []}},
+  {env, []}
+ ]}.
