@@ -3,7 +3,7 @@
 -include_lib("eunit/include/eunit.hrl").
 
 %% API
--export([connect/1, disconnect/1, claim/3]).
+-export([connect/1, disconnect/1, claim/3, workers/1]).
 
 -export([start_link/0]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
@@ -37,8 +37,9 @@ claim(Pool, F, Timeout) ->
 claim(Pool, F, Timeout, StartTime, Slot) ->
     case ets:slot(?TABLE, Slot-1) of
         [{worker, {Pool, Pid}, _, 0}] ->
-            case ets:update_counter(?TABLE, {Pool, Pid}, [{?LOCK_POS, 0},
-                                                          {?LOCK_POS, 1, 1, 1}]) of
+            case ets:update_counter(?TABLE, {Pool, Pid},
+                                    [{?LOCK_POS, 0},
+                                     {?LOCK_POS, 1, 1, 1}]) of
                 [0, 1] ->
                     try
                         {ok, F(Pid)}
@@ -83,8 +84,9 @@ worker_count(Pool) ->
     end.
 
 workers(Pool) ->
-    [Worker || {worker, {P, Worker}, _, _} <- ets:tab2list(?TABLE),
-               Pool == P].
+    [{Worker, State} || {worker, {P, Worker}, _, State} <- ets:tab2list(?TABLE),
+                        Pool == P].
+
 
 
 start_link() ->
@@ -210,7 +212,7 @@ test_multiple_workers() ->
                           spawn(?MODULE, worker_loop, [Pool, self()])],
     receive connected -> ok end,
     receive connected -> ok end,
-    ?assertEqual([Worker1, Worker2], workers(Pool)),
+    ?assertEqual([{Worker1, 0}, {Worker2, 0}], workers(Pool)),
 
     F = fun (Pid) ->
                 Pid ! {self(), do_work, 100},
@@ -230,7 +232,7 @@ test_timeout() ->
     Pool = test_pool,
     Worker = spawn(?MODULE, worker_loop, [Pool, self()]),
     receive connected -> ok end,
-    ?assertEqual([Worker], workers(Pool)),
+    ?assertEqual([{Worker, 0}], workers(Pool)),
 
     F = fun (Pid) ->
                 Pid ! {self, do_work, infinity},
@@ -239,6 +241,8 @@ test_timeout() ->
     Parent = self(),
     spawn(fun () -> Parent ! go, claim(Pool, F, 100) end),
     receive go -> ok end,
+
+    ?assertEqual([{Worker, 1}], workers(Pool)),
 
     Start = os:timestamp(),
     TimeoutUsec = 100,
@@ -257,28 +261,30 @@ test_monitor() ->
                    end),
     Monitor = erlang:monitor(process, Worker),
     receive connected -> ok end,
-    ?assertEqual([Worker], workers(Pool)),
+    ?assertEqual([{Worker, 0}], workers(Pool)),
 
     exit(Worker, kill),
 
-    receive M1 -> ?assertEqual({'DOWN', Monitor, process, Worker, killed}, M1) end,
+    receive M1 ->
+            ?assertEqual({'DOWN', Monitor, process, Worker, killed}, M1)
+    end,
     ?assertEqual([], workers(Pool)).
 
 
 test_already_connected() ->
     ?assertEqual([], workers(p)),
     ?assertEqual(ok, connect(p)),
-    ?assertEqual([self()], workers(p)),
+    ?assertEqual([{self(), 0}], workers(p)),
     ?assertEqual(1, worker_count(p)),
     ?assertEqual({error, already_connected}, connect(p)),
-    ?assertEqual([self()], workers(p)),
+    ?assertEqual([{self(), 0}], workers(p)),
     ?assertEqual(1, worker_count(p)).
 
 
 test_disconnect() ->
     ?assertEqual([], workers(p1)),
     ?assertEqual(ok, connect(p1)),
-    ?assertEqual([self()], workers(p1)),
+    ?assertEqual([{self(), 0}], workers(p1)),
     ?assertEqual(ok, disconnect(p1)),
     ?assertEqual([], workers(p1)),
     ?assertEqual({error, pool_not_found}, worker_count(p1)).
