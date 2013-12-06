@@ -50,7 +50,7 @@ claim(Pool, F, Timeout, StartTime, Slot) ->
                 [1, 1] ->
                     case timer:now_diff(os:timestamp(), StartTime) > Timeout of
                         true ->
-                            {error, timeout};
+                            {error, claim_timeout};
                         false ->
                             claim(Pool, F, Timeout, StartTime, next_slot(Pool))
                     end
@@ -59,7 +59,7 @@ claim(Pool, F, Timeout, StartTime, Slot) ->
         [{worker, _, _, 1}] ->
             case timer:now_diff(os:timestamp(), StartTime) > Timeout of
                 true ->
-                    {error, timeout};
+                    {error, claim_timeout};
                 false ->
                     claim(Pool, F, Timeout, StartTime, next_slot(Pool))
             end
@@ -242,7 +242,8 @@ test_timeout() ->
 
     Start = os:timestamp(),
     TimeoutUsec = 100,
-    ?assertEqual({error, timeout}, claim(Pool, fun (_) -> ok end, TimeoutUsec)),
+    ?assertEqual({error, claim_timeout},
+                 claim(Pool, fun (_) -> ok end, TimeoutUsec)),
     ?assert(timer:now_diff(os:timestamp(), Start) > TimeoutUsec).
 
 
