@@ -3,7 +3,9 @@
 -include_lib("eunit/include/eunit.hrl").
 
 %% API
--export([connect/1, disconnect/1, claim/3, workers/1]).
+-export([connect/1, connect/2]).
+-export([disconnect/1, disconnect/2]).
+-export([claim/3, workers/1]).
 
 -export([start_link/0]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
@@ -24,25 +26,31 @@
 %%
 
 connect(Pool) ->
-    gen_server:call(?MODULE, {connect, Pool, self()}).
+    connect(Pool, self()).
+
+connect(Pool, Pid) ->
+    gen_server:call(?MODULE, {connect, Pool, Pid}).
 
 disconnect(Pool) ->
-    gen_server:call(?MODULE, {disconnect, Pool, self()}).
+    disconnect(Pool, self()).
 
+disconnect(Pool, Pid) ->
+    gen_server:call(?MODULE, {disconnect, Pool, Pid}).
 
 
 claim(Pool, F, Timeout) ->
-    claim(Pool, F, Timeout, os:timestamp(), next_slot(Pool)).
+    claim(Pool, F, Timeout, os:timestamp(), 0, next_slot(Pool)).
 
-claim(Pool, F, Timeout, StartTime, Slot) ->
-    case ets:slot(?TABLE, Slot-1) of
+claim(Pool, F, Timeout, StartTime, Misses, Slot) ->
+    case catch ets:slot(?TABLE, Slot) of
         [{worker, {Pool, Pid}, _, 0}] ->
             case ets:update_counter(?TABLE, {Pool, Pid},
                                     [{?LOCK_POS, 0},
                                      {?LOCK_POS, 1, 1, 1}]) of
                 [0, 1] ->
+                    ElapsedUs = timer:now_diff(os:timestamp(), StartTime),
                     try
-                        {ok, F(Pid)}
+                        {ok, F(Pid, ElapsedUs, Misses)}
                     after
                         [0] = ets:update_counter(?TABLE, {Pool, Pid},
                                                  [{?LOCK_POS, 0, 0, 0}])
@@ -53,7 +61,7 @@ claim(Pool, F, Timeout, StartTime, Slot) ->
                         true ->
                             {error, claim_timeout};
                         false ->
-                            claim(Pool, F, Timeout, StartTime, next_slot(Pool))
+                            claim(Pool, F, Timeout, StartTime, Misses + 1, next_slot(Pool))
                     end
             end;
 
@@ -62,18 +70,27 @@ claim(Pool, F, Timeout, StartTime, Slot) ->
                 true ->
                     {error, claim_timeout};
                 false ->
-                    claim(Pool, F, Timeout, StartTime, next_slot(Pool))
+                    claim(Pool, F, Timeout, StartTime, Misses + 1, next_slot(Pool))
             end
     end.
-
-
 %%
 %% INTERNAL API
 %%
 
 next_slot(Pool) ->
+    next_slot(Pool,
+              erlang:system_info(scheduler_id),
+              erlang:system_info(schedulers_online)).
+
+next_slot(Pool, Partition, Partitions) ->
     Size = worker_count(Pool),
-    ets:update_counter(?SLOT_TABLE, Pool, {2, 1, Size, 1}).
+    PartitionSize = Size div Partitions,
+    MaxValue = PartitionSize * Partition,
+    MinValue = MaxValue - PartitionSize,
+
+    ets:update_counter(?SLOT_TABLE, {Pool, Partition}, {2, 1, MaxValue-1, MinValue}).
+
+
 
 worker_count(Pool) ->
     case ets:lookup(?SIZE_TABLE, Pool) of
@@ -98,14 +115,25 @@ start_link() ->
 %%
 
 init([]) ->
-    ets:new(?TABLE, [public, ordered_set, {keypos, 2},
-                     {read_concurrency, true}, named_table]),
+    ets:new(?TABLE, [public,
+                     ordered_set,
+                     {keypos, 2},
+                     {read_concurrency, true},
+                     {write_concurrency, true},
+                     named_table]),
 
-    ets:new(?SLOT_TABLE, [public, ordered_set, {keypos, 1},
-                          {read_concurrency, true}, named_table]),
+    ets:new(?SLOT_TABLE, [public,
+                          ordered_set,
+                          {keypos, 1},
+                          {read_concurrency, true},
+                          {write_concurrency, true},
+                          named_table]),
 
-    ets:new(?SIZE_TABLE, [public, ordered_set, {keypos, 1},
-                          {read_concurrency, true}, named_table]),
+    ets:new(?SIZE_TABLE, [public,
+                          ordered_set,
+                          {keypos, 1},
+                          {read_concurrency, true},
+                          named_table]),
 
     {ok, #state{}}.
 
@@ -114,14 +142,16 @@ handle_call({connect, Pool, Pid}, _From, State) ->
         false ->
             Monitor = erlang:monitor(process, Pid),
             true = ets:insert_new(?TABLE, {worker, {Pool, Pid}, Monitor, 0}),
-
-            case ets:member(?SLOT_TABLE, Pool) of
-                false ->
-                    true = ets:insert_new(?SLOT_TABLE, {Pool, 0});
-                true ->
-                    true
-            end,
             ets:insert(?SIZE_TABLE, {Pool, length(workers(Pool))}),
+
+            Size = worker_count(Pool),
+            PartitionSize = Size div erlang:system_info(schedulers),
+
+            lists:foreach(fun (Slot) ->
+                                  MaxValue = PartitionSize * Slot,
+                                  MinValue = MaxValue - PartitionSize,
+                                  ets:insert(?SLOT_TABLE, {{Pool, Slot}, MinValue})
+                          end, lists:seq(1, erlang:system_info(schedulers))),
             {reply, ok, State};
         true ->
             {reply, {error, already_connected}, State}
@@ -134,7 +164,9 @@ handle_call({disconnect, Pool, Pid}, _From, State) ->
             case length(workers(Pool)) of
                 0 ->
                     ets:delete(?SIZE_TABLE, Pool),
-                    ets:delete(?SLOT_TABLE, Pool);
+                    lists:foreach(fun (Slot) ->
+                                          ets:delete(?SLOT_TABLE, {Pool, Slot})
+                                  end, lists:seq(1, erlang:system_info(schedulers)));
                 N ->
                     ets:insert(?SIZE_TABLE, {Pool, N})
             end,
@@ -178,9 +210,11 @@ integration_test_() ->
      [
       ?_test(test_multiple_workers()),
       ?_test(test_timeout()),
+      ?_test(test_next_slot()),
       ?_test(test_monitor()),
       ?_test(test_already_connected()),
-      ?_test(test_disconnect())
+      ?_test(test_disconnect()),
+      {timeout, 60, ?_test(test_performance())}
      ]}.
 
 
@@ -214,14 +248,15 @@ test_multiple_workers() ->
     receive connected -> ok end,
     ?assertEqual([{Worker1, 0}, {Worker2, 0}], workers(Pool)),
 
-    F = fun (Pid) ->
+    F = fun (Pid, _, _) ->
                 Pid ! {self(), do_work, 100},
                 receive {result, Pid} -> Pid end
         end,
 
-    ?assertEqual({ok, Worker1}, claim(Pool, F, 100)),
-    ?assertEqual({ok, Worker2}, claim(Pool, F, 100)),
-    ?assertEqual({ok, Worker1}, claim(Pool, F, 100)),
+    %% claim(Pool, F, Timeout, StartTime, Misses, Slot)
+    ?assertEqual({ok, Worker1}, claim(Pool, F, 100, os:timestamp(), 0, 0)),
+    ?assertEqual({ok, Worker2}, claim(Pool, F, 100, os:timestamp(), 0, 1)),
+    ?assertEqual({ok, Worker1}, claim(Pool, F, 100, os:timestamp(), 0, 0)),
 
     [exit(P, kill) || P <- [Worker1, Worker2]],
     timer:sleep(10),
@@ -234,12 +269,13 @@ test_timeout() ->
     receive connected -> ok end,
     ?assertEqual([{Worker, 0}], workers(Pool)),
 
-    F = fun (Pid) ->
+    Parent = self(),
+    F = fun (Pid, _, _) ->
                 Pid ! {self, do_work, infinity},
+                Parent ! go,
                 receive M -> throw({unexpected_message, M}) end
         end,
-    Parent = self(),
-    spawn(fun () -> Parent ! go, claim(Pool, F, 100) end),
+    spawn(fun () -> claim(Pool, F, 100) end),
     receive go -> ok end,
 
     ?assertEqual([{Worker, 1}], workers(Pool)),
@@ -248,8 +284,30 @@ test_timeout() ->
     TimeoutUsec = 100,
     ?assertEqual({error, claim_timeout},
                  claim(Pool, fun (_) -> ok end, TimeoutUsec)),
-    ?assert(timer:now_diff(os:timestamp(), Start) > TimeoutUsec).
+    ?assert(timer:now_diff(os:timestamp(), Start) > TimeoutUsec),
+    exit(Worker, kill),
+    ok = disconnect(Pool, Worker),
+    ?assertEqual([], ets:tab2list(?TABLE)).
 
+
+test_next_slot() ->
+    Pool = next_slot_pool,
+    Workers = [begin
+                   W = spawn(?MODULE, worker_loop, [Pool, self()]),
+                   receive connected -> ok end,
+                   W
+               end || _ <- lists:seq(1, 32)],
+
+    32 = worker_count(Pool),
+
+    ?assertEqual([0, 1, 2, 3],
+                 lists:usort(
+                   lists:map(fun (_) ->
+                                     next_slot(Pool, 1, 8)
+                             end, lists:seq(1, 64)))),
+
+    [disconnect(Pool, W) || W <- Workers],
+    ok.
 
 test_monitor() ->
     Pool = monitor,
@@ -268,17 +326,20 @@ test_monitor() ->
     receive M1 ->
             ?assertEqual({'DOWN', Monitor, process, Worker, killed}, M1)
     end,
+    timer:sleep(10),
     ?assertEqual([], workers(Pool)).
 
 
 test_already_connected() ->
-    ?assertEqual([], workers(p)),
-    ?assertEqual(ok, connect(p)),
-    ?assertEqual([{self(), 0}], workers(p)),
-    ?assertEqual(1, worker_count(p)),
-    ?assertEqual({error, already_connected}, connect(p)),
-    ?assertEqual([{self(), 0}], workers(p)),
-    ?assertEqual(1, worker_count(p)).
+    [] = workers(p),
+    ok = connect(p),
+    [{_, 0}] = workers(p),
+    1 = worker_count(p),
+    {error, already_connected} = connect(p),
+    [{_, 0}] = workers(p),
+    1 = worker_count(p),
+    ok = disconnect(p).
+
 
 
 test_disconnect() ->
@@ -288,3 +349,60 @@ test_disconnect() ->
     ?assertEqual(ok, disconnect(p1)),
     ?assertEqual([], workers(p1)),
     ?assertEqual({error, pool_not_found}, worker_count(p1)).
+
+
+test_performance() ->
+    test_performance(1, 1, 100000),
+    test_performance(1, 4, 100000),
+    test_performance(8, 8, 100000),
+    test_performance(32, 32, 10000),
+    test_performance(256, 32, 10000),
+    test_performance(256, 256, 10000).
+
+test_performance(PoolSize, CallerSize, Num) ->
+    Pool = perf_pool,
+    ?assertEqual([], ets:tab2list(?TABLE)),
+    Workers = [begin
+                   W = spawn(?MODULE, worker_loop, [Pool, self()]),
+                   receive connected -> ok end,
+                   W
+               end || _ <- lists:seq(1, PoolSize)],
+
+    Req = fun (_, _ElapsedUs, _Misses) ->
+                  true
+          end,
+
+    Parent = self(),
+
+    ClaimLoop = fun (_, N) when Num =:= N ->
+                         ok;
+                     (F, N) ->
+                        case claim(Pool, Req, 100) of
+                            {ok, true} ->
+                                F(F, N+1);
+                            {error, claim_timeout} ->
+                                F(F, N)
+                        end
+                 end,
+
+    CallerF = fun () ->
+                      receive go -> ok end,
+                      Start = os:timestamp(),
+                      ok = ClaimLoop(ClaimLoop, 0),
+                      Parent ! {self(), done, timer:now_diff(os:timestamp(),
+                                                             Start)}
+              end,
+
+    Claimers = [spawn(CallerF) || _ <- lists:seq(1, CallerSize)],
+    [Pid ! go || Pid <- Claimers],
+
+    ElapsedUs = lists:map(fun (Pid) -> receive {Pid, done, Us} -> Us end end,
+                          Claimers),
+
+    error_logger:info_msg("pool size: ~p, callers: ~p, claims: ~p~n"
+                          "avg per claim: ~.2f us, max: ~p us~n",
+                          [PoolSize, CallerSize, Num,
+                           lists:sum(ElapsedUs) / (Num * length(Claimers)),
+                           lists:max(ElapsedUs)]),
+
+    [disconnect(Pool, W) || W <- Workers].
