@@ -20,6 +20,7 @@
 -define(SIZE_TABLE, pool_sizes).
 -define(SLOT_TABLE, pool_slots).
 -define(LOCK_POS, 4).
+-define(REF_POS, 5).
 
 %%
 %% API
@@ -43,18 +44,16 @@ claim(Pool, F, Timeout) ->
 
 claim(Pool, F, Timeout, StartTime, Misses, Slot) ->
     case catch ets:slot(?TABLE, Slot) of
-        [{worker, {Pool, Pid}, _, 0}] ->
+        [{worker, {Pool, Pid}, _, 0, undefined}] ->
             case ets:update_counter(?TABLE, {Pool, Pid},
                                     [{?LOCK_POS, 0},
                                      {?LOCK_POS, 1, 1, 1}]) of
                 [0, 1] ->
                     ElapsedUs = timer:now_diff(os:timestamp(), StartTime),
-                    try
-                        {ok, F(Pid, ElapsedUs, Misses)}
-                    after
-                        [0] = ets:update_counter(?TABLE, {Pool, Pid},
-                                                 [{?LOCK_POS, 0, 0, 0}])
-                    end;
+                    Ref = erlang:make_ref(),
+                    ets:update_element(?TABLE, {Pool, Pid}, {?REF_POS, Ref}),
+
+                    {ok, F(Pid, {Pool, Pid, Ref}, ElapsedUs, Misses)};
 
                 [1, 1] ->
                     case timer:now_diff(os:timestamp(), StartTime) > Timeout of
@@ -65,7 +64,7 @@ claim(Pool, F, Timeout, StartTime, Misses, Slot) ->
                     end
             end;
 
-        [{worker, _, _, 1}] ->
+        [{worker, _, _, 1, _}] ->
             case timer:now_diff(os:timestamp(), StartTime) > Timeout of
                 true ->
                     {error, claim_timeout};
@@ -73,6 +72,22 @@ claim(Pool, F, Timeout, StartTime, Misses, Slot) ->
                     claim(Pool, F, Timeout, StartTime, Misses + 1, next_slot(Pool))
             end
     end.
+
+release({Pool, Pid, Ref}) ->
+    case ets:lookup_element(?TABLE, {Pool, Pid}, ?REF_POS) of
+        undefined ->
+            {error, not_locked};
+        Ref ->
+            ets:update_element(?TABLE, {Pool, Pid},
+                               {?REF_POS, undefined}),
+            [0] = ets:update_counter(?TABLE, {Pool, Pid},
+                                     [{?LOCK_POS, 0, 0, 0}]),
+            ok;
+        OtherRef ->
+            error_logger:info_msg("other ref: ~p", [OtherRef]),
+            {error, other_owner}
+    end.
+
 %%
 %% INTERNAL API
 %%
@@ -101,8 +116,9 @@ worker_count(Pool) ->
     end.
 
 workers(Pool) ->
-    [{Worker, State} || {worker, {P, Worker}, _, State} <- ets:tab2list(?TABLE),
-                        Pool == P].
+    [{Worker, State} ||
+        {worker, {P, Worker}, _, State, _} <- ets:tab2list(?TABLE),
+        Pool == P].
 
 
 
@@ -141,7 +157,7 @@ handle_call({connect, Pool, Pid}, _From, State) ->
     case ets:member(?TABLE, {Pool, Pid}) of
         false ->
             Monitor = erlang:monitor(process, Pid),
-            true = ets:insert_new(?TABLE, {worker, {Pool, Pid}, Monitor, 0}),
+            true = ets:insert_new(?TABLE, {worker, {Pool, Pid}, Monitor, 0, undefined}),
             ets:insert(?SIZE_TABLE, {Pool, length(workers(Pool))}),
 
             Size = worker_count(Pool),
@@ -180,11 +196,11 @@ handle_cast(_Msg, State) ->
     {noreply, State}.
 
 handle_info({'DOWN', Monitor, process, Pid, _Reason}, State) ->
-    Match = {worker, {'_', Pid}, Monitor, '_'},
+    Match = {worker, {'_', Pid}, Monitor, '_', '_'},
     Guard = [],
     Return = ['$_'],
     case ets:select(?TABLE, [{Match, Guard, Return}]) of
-        [{worker, {Pool, Pid}, Monitor, _}] ->
+        [{worker, {Pool, Pid}, Monitor, _, _}] ->
             ets:delete(?TABLE, {Pool, Pid}),
             ets:insert(?SIZE_TABLE, {Pool, length(workers(Pool))}),
             {noreply, State};
@@ -232,9 +248,10 @@ worker_loop(Pool, Parent) ->
     do_worker_loop().
 
 do_worker_loop() ->
-    receive {From, do_work, Sleep} ->
+    receive {From, do_work, Sleep, Ref} ->
             timer:sleep(Sleep),
             From ! {result, self()},
+            release(Ref),
             do_worker_loop()
     end.
 
@@ -248,8 +265,8 @@ test_multiple_workers() ->
     receive connected -> ok end,
     ?assertEqual([{Worker1, 0}, {Worker2, 0}], workers(Pool)),
 
-    F = fun (Pid, _, _) ->
-                Pid ! {self(), do_work, 100},
+    F = fun (Pid, Lock, _, _) ->
+                Pid ! {self(), do_work, 100, Lock},
                 receive {result, Pid} -> Pid end
         end,
 
@@ -270,8 +287,8 @@ test_timeout() ->
     ?assertEqual([{Worker, 0}], workers(Pool)),
 
     Parent = self(),
-    F = fun (Pid, _, _) ->
-                Pid ! {self, do_work, infinity},
+    F = fun (Pid, Lock, _, _) ->
+                Pid ! {self, do_work, infinity, Lock},
                 Parent ! go,
                 receive M -> throw({unexpected_message, M}) end
         end,
@@ -283,7 +300,7 @@ test_timeout() ->
     Start = os:timestamp(),
     TimeoutUsec = 100,
     ?assertEqual({error, claim_timeout},
-                 claim(Pool, fun (_) -> ok end, TimeoutUsec)),
+                 claim(Pool, fun (_, _, _, _) -> ok end, TimeoutUsec)),
     ?assert(timer:now_diff(os:timestamp(), Start) > TimeoutUsec),
     exit(Worker, kill),
     ok = disconnect(Pool, Worker),
@@ -368,7 +385,8 @@ test_performance(PoolSize, CallerSize, Num) ->
                    W
                end || _ <- lists:seq(1, PoolSize)],
 
-    Req = fun (_, _ElapsedUs, _Misses) ->
+    Req = fun (_Pid, Lock, _ElapsedUs, _Misses) ->
+                  release(Lock),
                   true
           end,
 
