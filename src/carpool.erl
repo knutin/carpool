@@ -5,7 +5,7 @@
 %% API
 -export([connect/1, connect/2]).
 -export([disconnect/1, disconnect/2]).
--export([claim/3, workers/1]).
+-export([claim/3, release/1, workers/1]).
 
 -export([start_link/0]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
