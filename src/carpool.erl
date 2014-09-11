@@ -1,6 +1,10 @@
 -module(carpool).
 -behaviour(gen_server).
+
+-ifdef(TEST).
 -include_lib("eunit/include/eunit.hrl").
+-export([worker_loop/2]).
+-endif.
 
 %% API
 -export([connect/1, connect/2]).
@@ -10,9 +14,6 @@
 -export([start_link/0]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
          terminate/2, code_change/3]).
-
-%% Exported for testing
--export([worker_loop/2]).
 
 -record(state, {}).
 
@@ -220,6 +221,7 @@ code_change(_OldVsn, State, _Extra) ->
 %% TESTS
 %%
 
+-ifdef(TEST).
 
 integration_test_() ->
     {setup, fun setup/0, fun teardown/1,
@@ -424,3 +426,5 @@ test_performance(PoolSize, CallerSize, Num) ->
                            lists:max(ElapsedUs)]),
 
     [disconnect(Pool, W) || W <- Workers].
+
+-endif.
